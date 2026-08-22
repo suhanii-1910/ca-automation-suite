@@ -62,6 +62,70 @@ function parseAmount(s: string): number {
   return Number.isFinite(n) ? Math.abs(n) : 0;
 }
 
+/**
+ * Converts common Indian bank date formats to ISO-8601 (YYYY-MM-DD).
+ *
+ * Handled patterns:
+ *   dd/mm/yyyy       →  2026-06-13
+ *   dd-mm-yyyy       →  2026-06-13
+ *   dd Mon yyyy      →  2026-06-13  (e.g. "13 Jun 2026")
+ *   yyyy-mm-dd       →  passed through unchanged
+ *   OLE serial int   →  2026-06-08  (Google Sheets / Excel numeric date,
+ *                        e.g. 46181 — common when the bank CSV column has no
+ *                        explicit text format and Sheets stores the raw number)
+ *
+ * Returns the original string on any parse failure so callers can decide
+ * how to handle malformed dates.
+ */
+function normalizeDate(raw: string): string {
+  if (!raw) return raw;
+  const s = raw.trim();
+
+  // Already ISO-8601 — fast path.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // OLE / Lotus date serial: a plain 5-digit integer in the range
+  // roughly 40000–60000 (year 2009–2064). These appear when Google Sheets
+  // or Excel stores a date cell as a number and CSV export omits formatting.
+  //   Serial 1 = 1900-01-01, but OLE has an off-by-one: serial 60 is
+  //   incorrectly treated as 1900-02-29, so serials ≥ 61 must subtract 1
+  //   extra day (the standard correction applied by all spreadsheet apps).
+  if (/^\d{5}$/.test(s)) {
+    const serial = Number(s);
+    if (serial >= 40000 && serial <= 60000) {
+      const OLE_EPOCH = new Date(Date.UTC(1899, 11, 30)); // 1899-12-30
+      const ms = OLE_EPOCH.getTime() + serial * 86_400_000;
+      const d = new Date(ms);
+      const yyyy = d.getUTCFullYear();
+      const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+      const dd = String(d.getUTCDate()).padStart(2, "0");
+      return `${yyyy}-${mm}-${dd}`;
+    }
+  }
+
+  // dd/mm/yyyy or dd-mm-yyyy
+  const dmySep = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (dmySep) {
+    const [, dd, mm, yyyy] = dmySep;
+    return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+  }
+
+  // dd Mon yyyy  (e.g. "13 Jun 2026", "01 January 2026")
+  const monthNames: Record<string, string> = {
+    jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+    jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+  };
+  const dMonY = s.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
+  if (dMonY) {
+    const [, dd, mon, yyyy] = dMonY;
+    const mm = monthNames[mon.toLowerCase().slice(0, 3)];
+    if (mm) return `${yyyy}-${mm}-${dd.padStart(2, "0")}`;
+  }
+
+  // Unrecognised — return as-is so callers can log/fallback.
+  return s;
+}
+
 function normalizeRow(
   row: Record<string, string>
 ): { date: string; description: string; debit: number; credit: number } | null {
@@ -86,7 +150,7 @@ function normalizeRow(
 
   if (!date && !description) return null;
   return {
-    date: date || "",
+    date: date ? normalizeDate(date) : "",
     description: description || "",
     debit,
     credit,
@@ -148,7 +212,7 @@ export function evaluateTransactionAudit(
     rules.tdsContractor.keywords.some((tok) => desc.includes(tok));
   if (isTdsContractor) {
     flags.push(
-      `�️ Check TDS (${rules.tdsContractor.section} Applicability)`
+      `⚠️ Check TDS (${rules.tdsContractor.section} Applicability)`
     );
   }
 
@@ -173,7 +237,7 @@ export function evaluateTransactionAudit(
     );
   }
 
-  // ---- High-value round-sum (default: ≥ ₹1,00,000, no invoice signal) ----
+  // ---- High-value round-sum (Tiered: ≥ ₹10L -> HIGH, ₹1L to < ₹10L -> MEDIUM) ----
   const isHighValue = amount >= rules.roundSumThreshold;
   const isRoundSum =
     amount > 0 && (amount % 10_000 === 0 || amount % 50_000 === 0);
@@ -181,7 +245,15 @@ export function evaluateTransactionAudit(
     t.description
   );
   if (isHighValue && isRoundSum && !hasInvoiceSignal) {
-    flags.push("🔍 High-Value Round-Sum Transaction");
+    if (amount >= 1_000_000) {
+      flags.push(
+        `🚨 High-Value Round-Sum Transaction (₹${(amount / 100_000).toFixed(2)}L - Sec 269SS/269T Scrutiny Risk)`
+      );
+    } else {
+      flags.push(
+        `⚠️ High-Value Round-Sum Transaction (₹${(amount / 100_000).toFixed(2)}L)`
+      );
+    }
   }
 
   // ---- Lifestyle → Proprietor Drawings (safety net) ----
@@ -200,8 +272,11 @@ export function evaluateTransactionAudit(
 
   // Risk level roll-up: any 🔴 / 🚨 → HIGH; any ⚠️ → MEDIUM; else LOW.
   let risk: AuditRiskLevel = "LOW";
-  if (flags.some((f) => f.startsWith("🔴") || f.startsWith("🚨"))) risk = "HIGH";
-  else if (flags.some((f) => f.startsWith("⚠️"))) risk = "MEDIUM";
+  if (flags.some((f) => f.startsWith("🔴") || f.startsWith("🚨"))) {
+    risk = "HIGH";
+  } else if (flags.some((f) => f.startsWith("⚠️"))) {
+    risk = "MEDIUM";
+  }
 
   return { auditFlags: flags, auditRiskLevel: risk };
 }
@@ -343,51 +418,60 @@ export const parseBankStatement = task({
       rawRows = parsed.data
         .map(normalizeRow)
         .filter((r): r is NonNullable<typeof r> => r !== null);
-        } else {
+    } else {
       let pdfPart = safe.statementPdfBase64!.replace(
         /^data:[^;]+;base64,/,
         ""
       );
 
       try {
-  logger.info(
-    "parse-bank-statement: checking PDF protection"
-  );
+        logger.info("parse-bank-statement: checking PDF protection");
+        pdfPart = await decryptPdf(pdfPart, safe.pdfPassword);
+        logger.info("parse-bank-statement: PDF ready for Gemini");
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message === "PDF_PASSWORD_REQUIRED"
+        ) {
+          throw new Error(
+            "PDF_PASSWORD_REQUIRED: This bank statement is password protected. Please provide the PDF password."
+          );
+        }
 
-  pdfPart = await decryptPdf(
-    pdfPart,
-    safe.pdfPassword
-  );
+        if (
+          error instanceof Error &&
+          error.message === "INVALID_PDF_PASSWORD"
+        ) {
+          throw new Error(
+            "INVALID_PDF_PASSWORD: The PDF password is incorrect."
+          );
+        }
 
-  logger.info(
-    "parse-bank-statement: PDF ready for Gemini"
-  );
-} catch (error) {
-  if (
-    error instanceof Error &&
-    error.message === "PDF_PASSWORD_REQUIRED"
-  ) {
-    throw new Error(
-      "PDF_PASSWORD_REQUIRED: This bank statement is password protected. Please provide the PDF password."
-    );
-  }
+        if (
+          error instanceof Error &&
+          error.message === "PDF_DECRYPTOR_UNAVAILABLE"
+        ) {
+          throw new Error(
+            "PDF_DECRYPTOR_UNAVAILABLE: qpdf is required to decrypt password-protected bank statements. Install it locally (macOS: brew install qpdf) or deploy the configured Trigger worker image."
+          );
+        }
 
-  if (
-    error instanceof Error &&
-    error.message === "INVALID_PDF_PASSWORD"
-  ) {
-    throw new Error(
-      "INVALID_PDF_PASSWORD: The PDF password is incorrect."
-    );
-  }
+        if (
+          error instanceof Error &&
+          error.message === "PDF_DECRYPTION_FAILED"
+        ) {
+          throw new Error(
+            "PDF_DECRYPTION_FAILED: qpdf could not decrypt this PDF. Check that the file is a valid, supported PDF."
+          );
+        }
 
-  throw error;
-}
+        throw error;
+      }
 
       const prompt = `Extract every transaction from this bank statement PDF.
 Return JSON: { "rows": [{ "date": "YYYY-MM-DD", "description": "...", "debit": number, "credit": number }] }
 Use 0 for missing debit/credit. ISO-8601 dates. Return ONLY JSON.`;
-      
+
       const genai = getGenaiClient();
       const response = await genai.models.generateContent({
         model: "gemini-2.5-flash",
@@ -474,7 +558,7 @@ Return ONLY JSON: { "transactions": [ { "date": "...", "description": "...", "de
 
       for (const t of txs) {
         const parsed = transactionSchema.parse({
-          date: t.date ?? "",
+          date: t.date ? normalizeDate(String(t.date)) : "",
           description: t.description ?? "",
           debit: Number(t.debit ?? 0) || 0,
           credit: Number(t.credit ?? 0) || 0,
@@ -485,7 +569,7 @@ Return ONLY JSON: { "transactions": [ { "date": "...", "description": "...", "de
         const audit = evaluateTransactionAudit(parsed);
         out.push({
           ...parsed,
-          mappedTallyLedger: parsed.mappedTallyLedger, // may have been mutated by safety-net
+          mappedTallyLedger: parsed.mappedTallyLedger,
           auditFlags: audit.auditFlags,
           auditRiskLevel: audit.auditRiskLevel,
         });

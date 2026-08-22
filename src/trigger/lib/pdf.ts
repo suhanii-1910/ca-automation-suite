@@ -1,6 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -22,61 +27,104 @@ export async function decryptPdf(
   const outputPath = path.join(tempDir, "decrypted.pdf");
 
   try {
+    // ---------------------------------------------------------
+    // 1. Write Base64 PDF to temporary file
+    // ---------------------------------------------------------
+
     await writeFile(
       inputPath,
       Buffer.from(pdfBase64, "base64")
     );
 
     // ---------------------------------------------------------
-    // 1. Check whether the PDF requires a password
+    // 2. Check whether PDF requires a password
     // ---------------------------------------------------------
+
     if (!password) {
       try {
         await execFileAsync("qpdf", [
+          "--warning-exit-0",
           "--requires-password",
           inputPath,
         ]);
 
-        // Exit code 0 means a password is required.
-        throw new Error("PDF_PASSWORD_REQUIRED");
+        // If qpdf exits normally here, the PDF does not
+        // require a password.
+        return pdfBase64;
       } catch (error: any) {
-        // qpdf exit code 0 means password required.
-        // qpdf exit code 2 means the PDF does not require a password.
-        if (error?.code === 0) {
-          throw new Error("PDF_PASSWORD_REQUIRED");
-        }
+        const exitCode = error?.code;
 
-        if (error?.code === 2) {
-          // Normal, unprotected PDF.
+        // Exit code 0:
+        // No password required.
+        if (exitCode === 0) {
           return pdfBase64;
         }
 
+        // Exit code 2:
+        // PDF is not encrypted.
+        if (exitCode === 2) {
+          return pdfBase64;
+        }
+
+        // Anything else is an actual qpdf problem.
         throw error;
       }
     }
 
     // ---------------------------------------------------------
-    // 2. Password supplied → decrypt
+    // 3. Password supplied → decrypt PDF
     // ---------------------------------------------------------
+
     try {
       await execFileAsync("qpdf", [
         `--password=${password}`,
+        "--warning-exit-0",
         "--decrypt",
         inputPath,
         outputPath,
       ]);
-    } catch {
-      throw new Error("INVALID_PDF_PASSWORD");
+    } catch (error: any) {
+      const exitCode = error?.code;
+
+      // Exit code 2 = actual qpdf error.
+      // With an encrypted PDF, this normally means
+      // the password is incorrect.
+      if (exitCode === 2) {
+        throw new Error("INVALID_PDF_PASSWORD");
+      }
+
+      // Any other unexpected qpdf error.
+      throw new Error(
+        `PDF_DECRYPT_FAILED: ${
+          error?.stderr || error?.message || "Unknown qpdf error"
+        }`
+      );
     }
 
     // ---------------------------------------------------------
-    // 3. Return decrypted PDF as base64
+    // 4. Make sure decrypted file actually exists
     // ---------------------------------------------------------
-    const decryptedBuffer = await readFile(outputPath);
+
+    let decryptedBuffer: Buffer;
+
+    try {
+      decryptedBuffer = await readFile(outputPath);
+    } catch {
+      throw new Error(
+        "PDF_DECRYPT_FAILED: qpdf did not create the decrypted PDF."
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 5. Return decrypted PDF as Base64
+    // ---------------------------------------------------------
 
     return decryptedBuffer.toString("base64");
   } finally {
-    // Always delete temporary files.
+    // ---------------------------------------------------------
+    // 6. Always clean up temporary files
+    // ---------------------------------------------------------
+
     await rm(tempDir, {
       recursive: true,
       force: true,
